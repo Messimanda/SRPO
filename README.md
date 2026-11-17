@@ -1,258 +1,143 @@
-## Vision-SR1: Self-Rewarding Vision-Language Model via Reasoning Decomposition
+# SRPO
 
-[[📖 Paper](---)]  
+SRPO is a research codebase for reinforcement learning of vision-language models with **separate credit assignment for visual perception and reasoning**. The main implementation lives in [`vision_sd/`](vision_sd/), built on the training infrastructure of Vision-SR1, EasyR1, and veRL.
 
-**Models:**  
-[🤗 Vision-SR1-7B](https://huggingface.co/LMMs-Lab-Turtle/SelfRewarded-R1-7B) | 
-[🤗 Vision-SR1-7B-Cold-Start](https://huggingface.co/LMMs-Lab-Turtle/Qwen-2.5VL-7B-Cold-Start) 
+The repository includes Qwen2.5-VL-3B/7B training recipes, GRPO and DAPO-style baselines, token-level credit assignment variants, ablations, checkpoint export, and multimodal evaluation scripts. Internal module names retain the `vision_sd` prefix.
 
-**Datasets:**  
-[📊 Vision-SR1-Cold-Start-9K](https://huggingface.co/datasets/LMMs-Lab-Turtle/Vision-SR1-Cold-9K)  | 
-[📊 Vision-SR1-47K](https://huggingface.co/datasets/LMMs-Lab-Turtle/Vision-SR1-47K) 
+## Method and implementation
 
+The model generates a structured response:
 
-**Training Curves:**  
-[📈 Vision-SR1](https://api.wandb.ai/links/zli12321-university-of-maryland/85ed11ft) 
-
----
-
-## 👀 About Vision-SR1
-
-Vision-SR1 is a self-rewarded RL training framework to decompose VLMs' language reasoning into visual perception reasoning and language reasoning. Inspired by the awesome works of e.g. Vision-R1, Visionary-R1, R1-VL, we leverage VLM's self evolving and reasoning ability to **Reward Itself**. 
-
-Because VLMs fuse the vision encoder with the LLM backbone only late in pretraining, they often rely primarily on language reasoning rather than visual perception. Standard RL training tends to **recall prior language knowledge** for accuracy gains while **neglecting vision**. External LLM-based perception rewards can help but introduce bias and heavy latency. We instead propose a self-reward framework, enabling the model to provide its own visual and reasoning feedback with **no latency**.
-
-Besides vision decomposition, We constructed two datasets: **Vision-SR1-Cold-9K** for SFT and **Vision-SR1-47K** for RL.
-
-<p align="center">
-    <img src="./assets/26336512.png" width="80%">
-</p>
-
-### 🔍 Dataset
-Our training dataset is sourced from 23 sources and evenly split across three main areas -- general visual understanding, science knowledge, multimodal mathematical reasoning.
-
-<p align="center">
-    <img src="./assets/data.png" width="80%">
-</p>
-
-### New Features:
--- Supports Lora Training. Results are not verified.
--- Support Qwen3-VL series. However, Qwen3 series format reward is always 0. (Pending debug.)
--- Separate advantage computation for final answer accuracy and visual description accuracy.
-
-## Requirements
-
-The code base adopted from [verl](https://github.com/volcengine/verl) and [EasyR1](https://github.com/hiyouga/EasyR1).
-
-### Software Requirements
-
-- Python 3.9+
-- transformers=4.49.0
-
-### Setup
-```bash
-git clone https://github.com/zli12321/Vision-SR1.git
-cd Vision-SR1
-conda create -n Vision-SR1 python=3.12
-bash setup.sh
+```text
+<perception>Visual evidence needed to solve the problem.</perception>
+<reasoning>Reasoning grounded in that evidence.</reasoning>
+\boxed{FINAL ANSWER}
 ```
 
+The training pipeline combines:
+
+- **Answer supervision:** [`answer_reward.py`](vision_sd/reward_function/answer_reward.py) scores final-answer correctness and response format. Its default reward is `0.95 * accuracy + 0.05 * format`.
+- **Perception credit:** `simple_rlsd` compares token log probabilities under the original image and a weakened image, such as a partially masked image. The proportional variant assigns perception weights from these likelihood differences and normalizes them per sequence.
+- **Reasoning credit:** the `rlsvr` path uses clipped, advantage-dependent likelihood-ratio weights. The `rollout_vs_qi` variant compares rollout log probabilities with a question-and-image-only rescore of the same reasoning tail.
+- **Policy optimization:** GRPO-based updates, with recipes for DAPO-style asymmetric clipping, online filtering, and an optional entropy penalty.
+
+[`CreditDistillTrainer`](vision_sd/ray_trainer.py) implements the credit assignment. External-teacher and privileged-context variants are also included; their behavior is selected through `VISION_SD_*` environment variables. The `simple_rlsd` mode does not require external Teacher A.
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| [`vision_sd/`](vision_sd/) | SRPO training entry point, trainer, datasets, prompts, rewards, and experiment scripts |
+| [`verl/`](verl/) | Ray/FSDP workers, vLLM rollout, policy losses, and shared training utilities |
+| [`vision_r1/`](vision_r1/), [`vision_sr1/`](vision_sr1/) | Inherited accuracy-reward and self-reward training implementations |
+| [`vision_r1_lora/`](vision_r1_lora/), [`vision_sr1_lora/`](vision_sr1_lora/) | Inherited LoRA variants |
+| [`evaluation/`](evaluation/) | Response generation, answer judging, and accuracy reporting |
+| [`scripts/model_merger.py`](scripts/model_merger.py) | Export FSDP actor checkpoints to Hugging Face format |
+| [`LLaMA-Factory-Cold-Start/`](LLaMA-Factory-Cold-Start/) | Inherited supervised fine-tuning code |
+| [`examples/`](examples/) | Additional RL examples |
+
+## Installation
+
+Use Linux with NVIDIA GPUs and a CUDA-compatible PyTorch/vLLM installation. Training recipes generally target multiple GPUs; memory requirements depend on model size, sequence length, rollout count, and batch sizes.
+
+```bash
+git clone https://github.com/Messimanda/SRPO.git
+cd SRPO
+conda create -n srpo python=3.11 -y
+conda activate srpo
+```
+
+Install a mutually compatible PyTorch, torchvision, vLLM, and FlashAttention stack for your CUDA environment, then install the repository:
+
+```bash
+pip install -e .
+```
+
+See [`requirements.txt`](requirements.txt) for dependencies and [`setup.sh`](setup.sh) for the original environment recipe. That script contains explicit package pins, system-package installation, plotting dependencies, and an interactive W&B login; review it before running it on your machine. The dependency list alone is not a tested environment lockfile.
+
+## Data preparation
+
+Prepare the model weights and datasets separately. The experiment scripts reference **ViRL39K** for training and **MMK12** for validation; the base YAML files retain upstream Vision-SR1 dataset defaults. Pass your own paths explicitly when reproducing a recipe.
+
+The dataset loader supports Hugging Face dataset identifiers, local dataset directories, and Parquet/JSON/JSONL files. Append `@train` or `@test` to select a split.
+
+| Field | Meaning |
+| --- | --- |
+| `problem` | Question or prompt |
+| `answer` | Ground-truth answer used by the reward function |
+| `images` | Image inputs accepted by the dataset loader |
+
+Column names are configurable with `data.prompt_key`, `data.answer_key`, and `data.image_key`. Set `data.image_dir` to the image root when using relative image paths. The prompt template is [`perception_reasoning_answer.jinja`](vision_sd/format_prompt/perception_reasoning_answer.jinja).
 
 ## Training
 
-We support both full fine-tuning and LoRA fine-tuning for two training modes:
+Run commands from the repository root. **The shell recipes contain machine-specific paths.** Before launching, replace model, dataset, image-root, and checkpoint-output paths. In particular, changing `TRAIN_FILES` does not replace a hard-coded `data.image_dir` in a script.
 
-- **Vision-R1**: Standard GRPO with accuracy reward (`<think>...\boxed{}` format).
-- **Vision-SR1**: Self-reward GRPO with accuracy + self-generated perception reward (`<description>...<think>...\boxed{}` format).
+### Single-node proportional perception + reasoning credit
 
-### Full Fine-Tuning
-
-```bash
-# Vision-SR1 (Self-Reward) full fine-tuning
-bash ./vision_sr1/train.sh
-
-# Vision-R1 (standard accuracy) full fine-tuning
-bash ./vision_r1/train.sh
-```
-
-- Checkpoints are saved to `./saves/7b_grpo_self_reward/` and `./saves/7b_grpo_accuracy/` respectively.
-
-- To use Qwen3-VL, simply change the model name in train.sh file.
-
-### LoRA Fine-Tuning
+After adjusting `data.image_dir` in the selected script:
 
 ```bash
-# Vision-SR1 LoRA fine-tuning
-bash ./vision_sr1_lora/train.sh
-
-# Vision-R1 LoRA fine-tuning
-bash ./vision_r1_lora/train.sh
+TRAIN_FILES=/path/to/ViRL39K/39Krelease.parquet@train \
+VAL_FILES=/path/to/MMK12@test \
+TRAIN_N_GPUS=8 \
+bash vision_sd/train_simple_rlsd_prop_rlsvr_3b.sh /path/to/Qwen2.5-VL-3B-Instruct
 ```
 
-LoRA training uses `rank=64`, `lr=1e-5`, and only trains the language model layers (vision tower is excluded via `exclude_modules: .*visual.*`). Checkpoints are saved to `./saves/7b_grpo_self_reward_lora/` and `./saves/7b_grpo_accuracy_lora/` respectively.
+The corresponding 7B recipe is [`train_simple_rlsd_prop_rlsvr_7b.sh`](vision_sd/train_simple_rlsd_prop_rlsvr_7b.sh). These scripts use YAML configuration plus command-line overrides and export their credit-assignment settings before starting `python3 -m vision_sd.main`.
 
-### Merge Checkpoints
+### Multi-node rollout-vs-QI recipe
+
+The following recipes combine proportional perception credit, `rollout_vs_qi` reasoning credit, DAPO-style settings, and entropy penalty coefficient `0.03`:
+
+- [3B recipe](vision_sd/train_simple_rlsd_prop_rlsvr_rollout_qi_3b_multinode_dapo_entpen0p03.sh)
+- [7B recipe](vision_sd/train_simple_rlsd_prop_rlsvr_rollout_qi_7b_multinode_dapo_entpen0p03.sh)
+
+The committed launchers use Ray with a head node and worker nodes. Set `MASTER_ADDR`, `MASTER_PORT`, `NNODES`, `NODE_RANK`, and `NPROC_PER_NODE` consistently across machines; launch the script on each node with its own rank. All nodes need matching environments and access to the same model, code, and data paths. These launchers stop existing Ray processes, so use nodes allocated to this job.
+
+### Baselines and ablations
+
+| Experiment | Example script |
+| --- | --- |
+| Pure GRPO | [`train_pure_grpo_3b.sh`](vision_sd/train_pure_grpo_3b.sh) |
+| DAPO-style baseline | [`train_dapo_3b.sh`](vision_sd/train_dapo_3b.sh) |
+| No perception distillation | [`train_simple_rlsd_prop_rlsvr_rollout_qi_3b_multinode_dapo_entpen0p03_no_percdistill.sh`](vision_sd/train_simple_rlsd_prop_rlsvr_rollout_qi_3b_multinode_dapo_entpen0p03_no_percdistill.sh) |
+| Entropy penalty `0.1` | [`train_simple_rlsd_prop_rlsvr_rollout_qi_3b_multinode_dapo_entpen0p1.sh`](vision_sd/train_simple_rlsd_prop_rlsvr_rollout_qi_3b_multinode_dapo_entpen0p1.sh) |
+| External Teacher A | [`train_external_teacher_a_virl39k.sh`](vision_sd/train_external_teacher_a_virl39k.sh) |
+
+Check the selected script for its exact settings: recipes differ in credit assignment, KL regularization, filtering, and optimization parameters. Checkpoints are written to `trainer.save_checkpoint_path`; configure logging through `trainer.logger`.
+
+## Checkpoint export
+
+Export a specific actor checkpoint:
+
 ```bash
-python3 scripts/model_merger.py --local_dir CHECKPOINT_SAVE_DIR/global_step_*/actor
+python scripts/model_merger.py \
+  --local_dir /path/to/checkpoint/global_step_100/actor
 ```
 
-### Hardware Requirements
-
-\* *estimated*
-
-| Method                   | Bits |    3B   |   7B   |  
-| ------------------------ | ---- |  ------ | ------ | 
-| GRPO Full Fine-Tuning    |  AMP |  4/8 or 8x80GB | 4/8 or 8x80GB | 
-| GRPO LoRA Fine-Tuning    |  AMP |  2/4/8 or 8x32GB | 2/4/8 or 8x40GB | 
-
-> [!NOTE]
-> Use `worker.actor.fsdp.torch_dtype=bf16` and `worker.actor.optim.strategy=adamw_bf16` to enable bf16 training with fewer memory.
-
+Use the resulting `actor/huggingface` directory for inference or evaluation.
 
 ## Evaluation
 
-The `evaluation/` folder contains scripts for evaluating checkpoints across multiple benchmarks with automated answer extraction and LLM-based judging.
+[`eval_vision_sd.sh`](evaluation/full_rl/eval_vision_sd.sh) generates responses, extracts boxed answers, runs an LLM judge, and prints accuracy summaries.
 
-### Folder Structure
-
-```
-evaluation/
-├── eval_config.yaml              # Base evaluation config (val_only, greedy decoding)
-├── format_prompt/
-│   ├── cot_format.jinja           # CoT prompt template (for Vision-R1)
-│   └── see_think_format.jinja     # See-Think prompt template (for Vision-SR1)
-├── reward_function/
-│   └── eval_accuracy.py           # Rule-based accuracy scoring
-├── full_rl/
-│   ├── eval_vision_r1.sh          # Evaluate full fine-tuned Vision-R1 checkpoints
-│   └── eval_vision_sr1.sh         # Evaluate full fine-tuned Vision-SR1 checkpoints
-├── lora_rl/
-│   ├── eval_vision_r1_lora.sh     # Evaluate LoRA Vision-R1 checkpoints
-│   └── eval_vision_sr1_lora.sh    # Evaluate LoRA Vision-SR1 checkpoints
-├── llm_judge.py                   # Extract \boxed{} answers, then judge with LLM
-└── print_accuracy.py              # Print accuracy table from judgment files
-```
-
-### Running Evaluations
-
-#### Full Fine-Tuning Checkpoints
+Before running it, update `LOCAL_EVAL_ROOT`, `LOCAL_TRAIN_DATASET`, and the dataset list inside the script. The placeholder training dataset is required by this evaluation entry point even in validation-only mode. Set the GPU count to match your environment.
 
 ```bash
-# Evaluate base model (no checkpoint):
-bash evaluation/full_rl/eval_vision_r1.sh
-
-# Evaluate a specific checkpoint:
-bash evaluation/full_rl/eval_vision_r1.sh ./saves/7b_grpo_accuracy/global_step_15
-
-# Vision-SR1 variant:
-bash evaluation/full_rl/eval_vision_sr1.sh ./saves/7b_grpo_self_reward/global_step_15
+# Evaluate an exported model with a local judge.
+bash evaluation/full_rl/eval_vision_sd.sh \
+  /path/to/exported/huggingface \
+  /path/to/Qwen2.5-VL-3B-Instruct \
+  /path/to/judge-model
 ```
 
-#### LoRA Checkpoints
+The script also accepts a `global_step_*` checkpoint directory as its first argument. Its benchmark list includes MMStar, MM-Vet, VisNumBench, MMMU/MMMU-Pro, HallusionBench, MMSI, MathVerse, MathVision, MathVista, and RealWorldQA, among others. Dataset preparation and judge weights are required separately.
 
-```bash
-# LoRA checkpoint (required):
-bash evaluation/lora_rl/eval_vision_r1_lora.sh ./saves/7b_grpo_accuracy_lora/global_step_15
+Responses are stored under `evaluation/responses/`, with judgments under `evaluation/judgments/`. Existing nonempty response files are reused; use a fresh output location when changing the evaluated model or decoding settings.
 
-# Vision-SR1 LoRA:
-bash evaluation/lora_rl/eval_vision_sr1_lora.sh ./saves/7b_grpo_self_reward_lora/global_step_15
-```
+## Acknowledgments and license
 
-### Evaluation Pipeline
+This repository builds on [Vision-SR1](https://github.com/zli12321/Vision-SR1), [EasyR1](https://github.com/hiyouga/EasyR1), [veRL](https://github.com/volcengine/verl), and [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory). The inherited training code and datasets should be credited to their original authors.
 
-Each evaluation script runs the following three-stage pipeline automatically:
-
-1. **Generate responses**: Run the model on each benchmark dataset with greedy decoding (`temperature=0`), saving all responses to `evaluation/responses/`.
-
-2. **Extract & judge**: `llm_judge.py` extracts the final answer from `\boxed{}` in each response, then sends the extracted answer and the ground truth to an LLM judge (Qwen2.5-14B-Instruct via vLLM) for comparison. Judgments are saved to `evaluation/judgments/`.
-
-3. **Print accuracy**: `print_accuracy.py` aggregates the judgments and prints a per-dataset accuracy table comparing LLM-judge accuracy with the rule-based score.
-
-### Supported Benchmarks
-
-The evaluation scripts include the following datasets (uncomment as needed in the shell scripts):
-
-mmstar, mm-vet, MLLM_test, visnumbench, mmmu_pro_10options, mmmu-pro-vision, hallusionbench, MMMU, MMSI, mathverse, mathvision, mathvista, realWorldQA
-
-
-## Supervised Finetuning (Cold Start)
-
-The supervised finetuning code is adopted from [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) for easy setup.
-
-### Download the filtered SFT format data
-```bash
-while ! python download-sft-data.py; do echo "Retrying..."; sleep 5; done
-```
-
-### Setup
-```bash
-conda create -n SFT python=3.11
-cd LLaMA-Factory-Cold-Start
-pip install -e ".[torch,metrics]" --no-build-isolation
-
-pip install --upgrade huggingface_hub
-huggingface-cli login
-```
-
-### Training
-```bash
-FORCE_TORCHRUN=1 llamafactory-cli train examples/train_full/Vision-SR1-Cold-Start.yaml
-```
-
-### Troubleshoot
-If you still encounter errors after you follow the setup, simply clone the original LLaMA-Factory repo and follow their setup. Download the [dataset](https://huggingface.co/datasets/LMMs-Lab-Turtle/Vision-SR1-Cold-9K/tree/main) and place into the LLaMA-Factory [data folder](https://github.com/hiyouga/LLaMA-Factory/tree/main/data). Place the [Vision-SR1-Cold-Start.yaml](https://github.com/zli12321/Vision-SR1/blob/main/LLaMA-Factory-Cold-Start/examples/train_full/Vision-SR1-Cold-Start.yaml) file into the LLaMA-Factory [SFT training folder](https://github.com/hiyouga/LLaMA-Factory/tree/main/examples/train_full).
-
-
-## Custom Dataset
-
-Please refer to the example datasets to prepare your own dataset.
-
-- Text dataset: https://huggingface.co/datasets/hiyouga/math12k
-- Image-text dataset: https://huggingface.co/datasets/hiyouga/geometry3k
-- Multi-image-text dataset: https://huggingface.co/datasets/hiyouga/journeybench-multi-image-vqa
-
-
-## Reward Progression in Training
-
-![image](assets/reward_progression.png)
-
-
-## Citation
-
-If you find our works helpful, please cite
-
-```bibtex
-@misc{li2025selfrewardingvisionlanguagemodelreasoning,
-      title={Self-Rewarding Vision-Language Model via Reasoning Decomposition}, 
-      author={Zongxia Li and Wenhao Yu and Chengsong Huang and Rui Liu and Zhenwen Liang and Fuxiao Liu and Jingxi Che and Dian Yu and Jordan Boyd-Graber and Haitao Mi and Dong Yu},
-      year={2025},
-      eprint={2508.19652},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2508.19652}, 
-}
-
-@article{huang2508self,
-  title={Self-evolving reasoning llm from zero data, 2025},
-  author={Huang, Chengsong and Yu, Wenhao and Wang, Xiaoyang and Zhang, Hongming and Li, Zongxia and Li, Ruosen and Huang, Jiaxin and Mi, Haitao},
-  journal={URL https://arxiv. org/abs/2508.05004}
-}
-
-@article{he2025visplay,
-  title={Visplay: Self-evolving vision-language models from images},
-  author={He, Yicheng and Huang, Chengsong and Li, Zongxia and Huang, Jiaxin and Yang, Yonghui},
-  journal={arXiv preprint arXiv:2511.15661},
-  year={2025}
-}
-```
-
-We recommend to also cite the sourcecode work.
-
-```bibtex
-@misc{zheng2025easyr1,
-  title        = {EasyR1: An Efficient, Scalable, Multi-Modality RL Training Framework},
-  author       = {Yaowei Zheng, Junting Lu, Shenzhi Wang, Zhangchi Feng, Dongdong Kuang, Yuwen Xiong},
-  howpublished = {\url{https://github.com/hiyouga/EasyR1}},
-  year         = {2025}
-}
-```
+See [LICENSE](LICENSE) for the repository's Apache-2.0 license. Retain upstream notices and follow the applicable licenses for models and datasets used with this code.
